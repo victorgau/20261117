@@ -1,1 +1,411 @@
-Hello!
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>竹林小鳥</title>
+<style>
+  :root { --ink:#2b2a3a; --paper:#fff4dc; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: #2b2a3a;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 8px;
+    font-family: "PingFang TC","Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif;
+    color: var(--paper);
+    overscroll-behavior: none;
+    -webkit-user-select: none; user-select: none;
+  }
+  canvas {
+    display: block;
+    height: min(calc(100dvh - 44px), calc(100vw * 16 / 9));
+    aspect-ratio: 9 / 16;
+    touch-action: none;
+    border-radius: 6px;
+    cursor: pointer;
+    outline: none;
+  }
+  canvas:focus-visible { outline: 3px solid #ffd166; outline-offset: 3px; }
+  .bar { display: flex; gap: 12px; align-items: center; font-size: 13px; opacity: .85; }
+  button {
+    font: inherit; color: inherit; background: transparent;
+    border: 1px solid rgba(255,244,220,.45); border-radius: 999px;
+    padding: 3px 12px; cursor: pointer;
+  }
+  button:hover { background: rgba(255,244,220,.12); }
+  button:focus-visible { outline: 3px solid #ffd166; outline-offset: 2px; }
+</style>
+</head>
+<body>
+<canvas id="game" tabindex="0" aria-label="竹林小鳥遊戲畫面"></canvas>
+<div class="bar">
+  <span>點擊、空白鍵或 ↑ 拍翅</span>
+  <button id="mute" type="button" aria-pressed="false">音效：開</button>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  // ---------- 基本設定 ----------
+  const W = 360, H = 640, GROUND = 96;
+  const GRAVITY = 1500, FLAP = -430;
+  const PIPE_W = 64, GAP = 156, SPEED = 140, SPACING = 210;
+  const BIRD_X = 100, BIRD_R = 13;
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const muteBtn = document.getElementById('mute');
+
+  let best = 0;
+  try { best = +localStorage.getItem('bamboo-bird-best') || 0; } catch (e) {}
+
+  // ---------- 畫面縮放 ----------
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = Math.round(rect.width * dpr);
+    canvas.height = Math.round(rect.height * dpr);
+    ctx.setTransform(canvas.width / W, 0, 0, canvas.height / H, 0, 0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------- 音效 ----------
+  let audio = null, muted = false;
+  function tone(freq, endFreq, dur, type = 'square', vol = 0.06) {
+    if (muted) return;
+    try {
+      audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+      if (audio.state === 'suspended') audio.resume();
+      const o = audio.createOscillator(), g = audio.createGain();
+      const t = audio.currentTime;
+      o.type = type;
+      o.frequency.setValueAtTime(freq, t);
+      o.frequency.exponentialRampToValueAtTime(Math.max(endFreq, 1), t + dur);
+      g.gain.setValueAtTime(vol, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(g).connect(audio.destination);
+      o.start(t); o.stop(t + dur);
+    } catch (e) {}
+  }
+  const sfx = {
+    flap:  () => tone(420, 640, 0.09),
+    score: () => { tone(880, 880, 0.08, 'sine', 0.08); setTimeout(() => tone(1175, 1175, 0.12, 'sine', 0.08), 70); },
+    hit:   () => tone(220, 50, 0.3, 'sawtooth', 0.09)
+  };
+  muteBtn.addEventListener('click', e => {
+    muted = !muted;
+    muteBtn.textContent = '音效：' + (muted ? '關' : '開');
+    muteBtn.setAttribute('aria-pressed', muted);
+    e.currentTarget.blur();
+  });
+
+  // ---------- 遊戲狀態 ----------
+  let state = 'ready';            // ready | playing | dead
+  let bird, pipes, score, groundX, time, deadTimer, flash, newBest, shake;
+
+  function reset() {
+    bird = { y: H * 0.42, vy: 0, rot: 0, wing: 0 };
+    pipes = [];
+    score = 0; groundX = 0; deadTimer = 0; flash = 0; shake = 0; newBest = false;
+    state = 'ready';
+  }
+  time = 0;
+  reset();
+
+  function spawnPipe(x) {
+    const min = GAP / 2 + 70, max = H - GROUND - GAP / 2 - 70;
+    pipes.push({ x, gapY: min + Math.random() * (max - min), passed: false });
+  }
+
+  function flap() {
+    if (state === 'ready') { state = 'playing'; spawnPipe(W + 80); }
+    if (state === 'playing') {
+      bird.vy = FLAP;
+      sfx.flap();
+    } else if (state === 'dead' && deadTimer > 0.6) {
+      reset();
+    }
+  }
+
+  function die() {
+    if (state !== 'playing') return;
+    state = 'dead';
+    sfx.hit();
+    flash = 1; shake = 0.25;
+    if (score > best) {
+      best = score; newBest = true;
+      try { localStorage.setItem('bamboo-bird-best', best); } catch (e) {}
+    }
+  }
+
+  // ---------- 輸入 ----------
+  canvas.addEventListener('pointerdown', e => { e.preventDefault(); flap(); });
+  window.addEventListener('keydown', e => {
+    if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
+      e.preventDefault();
+      if (!e.repeat) flap();
+    } else if (e.code === 'KeyM') {
+      muteBtn.click();
+    }
+  });
+  canvas.focus({ preventScroll: true });
+
+  // ---------- 更新 ----------
+  function hitsRect(cx, cy, r, x, y, w, h) {
+    const nx = Math.max(x, Math.min(cx, x + w));
+    const ny = Math.max(y, Math.min(cy, y + h));
+    const dx = cx - nx, dy = cy - ny;
+    return dx * dx + dy * dy < r * r;
+  }
+
+  function update(dt) {
+    time += dt;
+    bird.wing += dt * (state === 'dead' ? 0 : 16);
+
+    if (state !== 'dead') groundX = (groundX + SPEED * dt) % 28;
+    if (flash > 0) flash = Math.max(0, flash - dt * 4);
+    if (shake > 0) shake = Math.max(0, shake - dt);
+
+    if (state === 'ready') {
+      bird.y = H * 0.42 + Math.sin(time * 4.5) * 8;
+      bird.rot = 0;
+      return;
+    }
+
+    bird.vy += GRAVITY * dt;
+    bird.y += bird.vy * dt;
+    bird.rot = Math.max(-0.5, Math.min(1.4, bird.vy / 520));
+
+    if (state === 'playing') {
+      for (const p of pipes) p.x -= SPEED * dt;
+      if (pipes.length && pipes[0].x < -PIPE_W - 10) pipes.shift();
+      if (!pipes.length || pipes[pipes.length - 1].x < W - SPACING) spawnPipe(W + 20);
+
+      for (const p of pipes) {
+        if (!p.passed && p.x + PIPE_W < BIRD_X - BIRD_R) {
+          p.passed = true; score++; sfx.score();
+        }
+        const topH = p.gapY - GAP / 2;
+        const botY = p.gapY + GAP / 2;
+        if (hitsRect(BIRD_X, bird.y, BIRD_R - 1, p.x, 0, PIPE_W, topH) ||
+            hitsRect(BIRD_X, bird.y, BIRD_R - 1, p.x, botY, PIPE_W, H - GROUND - botY)) {
+          die(); break;
+        }
+      }
+      if (bird.y - BIRD_R < -40) bird.y = -40 + BIRD_R;
+      if (bird.y + BIRD_R >= H - GROUND) { bird.y = H - GROUND - BIRD_R; die(); }
+    } else { // dead
+      deadTimer += dt;
+      if (bird.y + BIRD_R >= H - GROUND) {
+        bird.y = H - GROUND - BIRD_R; bird.vy = 0;
+        bird.rot = Math.min(bird.rot + dt * 8, 1.57);
+      }
+    }
+  }
+
+  // ---------- 繪圖 ----------
+  const skyGrad = ctx.createLinearGradient(0, 0, 0, H - GROUND);
+  skyGrad.addColorStop(0, '#5b6fb5');
+  skyGrad.addColorStop(0.55, '#f0a07c');
+  skyGrad.addColorStop(1, '#ffd9a0');
+
+  function hills(color, base, amp, wave, speed, phase) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(0, H - GROUND);
+    const off = (state === 'dead' ? 0 : time) * speed;
+    for (let x = 0; x <= W; x += 6) {
+      ctx.lineTo(x, base + Math.sin((x + off) * wave + phase) * amp + Math.sin((x + off) * wave * 2.3) * amp * 0.35);
+    }
+    ctx.lineTo(W, H - GROUND);
+    ctx.closePath(); ctx.fill();
+  }
+
+  function cloud(x, y, s) {
+    ctx.fillStyle = 'rgba(255,244,220,.55)';
+    ctx.beginPath();
+    ctx.ellipse(x, y, 34 * s, 10 * s, 0, 0, 7);
+    ctx.ellipse(x - 14 * s, y - 7 * s, 16 * s, 10 * s, 0, 0, 7);
+    ctx.ellipse(x + 10 * s, y - 9 * s, 18 * s, 12 * s, 0, 0, 7);
+    ctx.fill();
+  }
+
+  function drawBackground() {
+    ctx.fillStyle = skyGrad;
+    ctx.fillRect(0, 0, W, H);
+    // 夕陽
+    ctx.fillStyle = '#ffe9b8';
+    ctx.beginPath(); ctx.arc(250, 330, 46, 0, 7); ctx.fill();
+    // 雲
+    const drift = (state === 'dead' ? 0 : time) * 6;
+    for (const [cx, cy, s, sp] of [[60, 120, 1, 1], [250, 70, 1.3, 0.6], [330, 200, 0.8, 1.4]]) {
+      cloud(((cx - drift * sp) % (W + 120) + W + 120) % (W + 120) - 60, cy, s);
+    }
+    hills('#8a6fa0', 470, 26, 0.012, 6, 0);
+    hills('#5a5a8c', 510, 20, 0.018, 14, 2);
+  }
+
+  function drawBamboo(x, y0, y1, capEnd) {
+    if (y1 - y0 <= 0) return;
+    const g = ctx.createLinearGradient(x, 0, x + PIPE_W, 0);
+    g.addColorStop(0, '#3d7a3c');
+    g.addColorStop(0.35, '#8fd16a');
+    g.addColorStop(1, '#2f6a35');
+    ctx.fillStyle = g;
+    ctx.fillRect(x, y0, PIPE_W, y1 - y0);
+    // 竹節
+    for (let y = Math.ceil(y0 / 64) * 64; y < y1; y += 64) {
+      if (y < y0 + 4 || y > y1 - 4) continue;
+      ctx.fillStyle = '#2a5c2e';
+      ctx.fillRect(x - 3, y - 3, PIPE_W + 6, 6);
+      ctx.fillStyle = 'rgba(255,255,255,.25)';
+      ctx.fillRect(x - 3, y - 3, PIPE_W + 6, 2);
+    }
+    // 管口
+    const cy = capEnd === 'bottom' ? y1 - 20 : y0;
+    ctx.fillStyle = g;
+    ctx.fillRect(x - 5, cy, PIPE_W + 10, 20);
+    ctx.fillStyle = '#2a5c2e';
+    ctx.fillRect(x - 5, capEnd === 'bottom' ? y1 - 4 : y0, PIPE_W + 10, 4);
+    ctx.fillStyle = 'rgba(255,255,255,.25)';
+    ctx.fillRect(x - 5, cy + (capEnd === 'bottom' ? 0 : 4), PIPE_W + 10, 2);
+  }
+
+  function drawGround() {
+    ctx.fillStyle = '#7a5a3c';
+    ctx.fillRect(0, H - GROUND, W, GROUND);
+    ctx.fillStyle = '#9ac45a';
+    ctx.fillRect(0, H - GROUND, W, 14);
+    ctx.fillStyle = '#6f9a3e';
+    for (let x = -groundX; x < W; x += 28) {
+      ctx.beginPath();
+      ctx.moveTo(x, H - GROUND + 14);
+      ctx.lineTo(x + 14, H - GROUND + 14);
+      ctx.lineTo(x + 7, H - GROUND + 4);
+      ctx.fill();
+    }
+    ctx.fillStyle = '#654a31';
+    for (let x = -groundX * 1.0; x < W; x += 28) {
+      ctx.fillRect(x + 4, H - GROUND + 40, 10, 4);
+      ctx.fillRect(x + 16, H - GROUND + 64, 6, 4);
+    }
+  }
+
+  function drawBird() {
+    ctx.save();
+    ctx.translate(BIRD_X, bird.y);
+    ctx.rotate(bird.rot);
+    // 尾羽
+    ctx.fillStyle = '#e08a3c';
+    ctx.beginPath(); ctx.moveTo(-10, -2); ctx.lineTo(-22, -6); ctx.lineTo(-20, 3); ctx.lineTo(-11, 5); ctx.fill();
+    // 身體
+    ctx.fillStyle = '#ffd166';
+    ctx.beginPath(); ctx.ellipse(0, 0, 16, 13, 0, 0, 7); ctx.fill();
+    ctx.fillStyle = '#fff0c4';
+    ctx.beginPath(); ctx.ellipse(3, 6, 10, 6, 0, 0, 7); ctx.fill();
+    // 頭頂羽
+    ctx.fillStyle = '#e8564a';
+    ctx.beginPath(); ctx.moveTo(-2, -11); ctx.lineTo(2, -20); ctx.lineTo(5, -11); ctx.lineTo(8, -18); ctx.lineTo(9, -9); ctx.fill();
+    // 翅膀
+    const w = Math.sin(bird.wing) * 7;
+    ctx.fillStyle = '#f0a43a';
+    ctx.beginPath(); ctx.ellipse(-5, 2 + (state === 'dead' ? 2 : w * 0.3), 9, 6 + (state === 'dead' ? 0 : Math.abs(w) * 0.2), -0.3 + w * 0.05, 0, 7); ctx.fill();
+    // 眼睛
+    ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(8, -4, 5, 0, 7); ctx.fill();
+    ctx.fillStyle = '#2b2a3a';
+    if (state === 'dead') {
+      ctx.strokeStyle = '#2b2a3a'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(6, -6); ctx.lineTo(10, -2); ctx.moveTo(10, -6); ctx.lineTo(6, -2); ctx.stroke();
+    } else {
+      ctx.beginPath(); ctx.arc(9.5, -4, 2.2, 0, 7); ctx.fill();
+    }
+    // 嘴
+    ctx.fillStyle = '#e8564a';
+    ctx.beginPath(); ctx.moveTo(13, 0); ctx.lineTo(23, 2); ctx.lineTo(13, 6); ctx.fill();
+    ctx.restore();
+  }
+
+  const FONT = '"PingFang TC","Noto Sans TC","Microsoft JhengHei",sans-serif';
+  function text(str, x, y, size, color = '#fff4dc', align = 'center', stroke = true) {
+    ctx.font = `700 ${size}px ${FONT}`;
+    ctx.textAlign = align;
+    ctx.textBaseline = 'middle';
+    if (stroke) {
+      ctx.lineJoin = 'round';
+      ctx.lineWidth = size * 0.18;
+      ctx.strokeStyle = 'rgba(43,42,58,.85)';
+      ctx.strokeText(str, x, y);
+    }
+    ctx.fillStyle = color;
+    ctx.fillText(str, x, y);
+  }
+
+  function drawPanel() {
+    const x = 40, y = 190, w = W - 80, h = 230;
+    ctx.fillStyle = '#fff4dc';
+    ctx.strokeStyle = '#2b2a3a';
+    ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.roundRect(x, y, w, h, 14); ctx.fill(); ctx.stroke();
+    text('遊戲結束', W / 2, y + 40, 28, '#e8564a', 'center', false);
+    ctx.font = `600 15px ${FONT}`;
+    text('本次得分', x + 40, y + 96, 15, '#2b2a3a', 'left', false);
+    text(String(score), x + w - 40, y + 96, 30, '#2b2a3a', 'right', false);
+    text('最高紀錄', x + 40, y + 142, 15, '#2b2a3a', 'left', false);
+    text(String(best), x + w - 40, y + 142, 30, '#2b2a3a', 'right', false);
+    if (newBest) text('新紀錄！', W / 2, y + 74, 14, '#d9531e', 'center', false);
+    if (deadTimer > 0.6) {
+      const a = 0.6 + Math.sin(time * 6) * 0.4;
+      ctx.globalAlpha = a;
+      text('點一下再玩一次', W / 2, y + 192, 16, '#2b2a3a', 'center', false);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function draw() {
+    ctx.save();
+    if (shake > 0) ctx.translate((Math.random() - 0.5) * 8 * shake * 4, (Math.random() - 0.5) * 8 * shake * 4);
+
+    drawBackground();
+    for (const p of pipes) {
+      drawBamboo(p.x, 0, p.gapY - GAP / 2, 'bottom');
+      drawBamboo(p.x, p.gapY + GAP / 2, H - GROUND, 'top');
+    }
+    drawGround();
+    drawBird();
+
+    if (state === 'playing' || (state === 'dead' && deadTimer < 0.01)) {
+      text(String(score), W / 2, 80, 52);
+    }
+    if (state === 'ready') {
+      text('竹林小鳥', W / 2, 150, 44);
+      text('點一下開始拍翅', W / 2, 400, 18);
+      text(best ? '最高紀錄 ' + best : '穿過竹子之間的縫隙', W / 2, 430, 14, '#ffe9b8');
+    }
+    if (state === 'dead') drawPanel();
+
+    ctx.restore();
+
+    if (flash > 0) {
+      ctx.fillStyle = `rgba(255,255,255,${flash * 0.7})`;
+      ctx.fillRect(0, 0, W, H);
+    }
+  }
+
+  // ---------- 主迴圈 ----------
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min((now - last) / 1000, 1 / 30);
+    last = now;
+    update(dt);
+    draw();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
